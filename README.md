@@ -25,6 +25,16 @@ asdf plugin-add java https://github.com/uzxmx/asdf-java.git
 
 Check [asdf](https://asdf-vm.github.io/asdf/) for instructions on how to install & manage versions of Java.
 
+If you experienced the error like below, most probably it's because of TUNA only
+mirrors the latest JDK version for each variant. So you need to update your local
+JDK version to resolve this issue.
+
+```
+OpenJDK11U-jdk_x64_linux_hotspot_11.0.6_10.tar.gz
+OpenJDK11U-jdk_x64_linux_hotspot_11.0.6_10.tar.gz: FAILED
+sha256sum: WARNING: 1 computed checksum did NOT match
+```
+
 ## Install
 
 List candidate JDKs:
