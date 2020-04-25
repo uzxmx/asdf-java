@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -e
+set -Euo pipefail
+
+PLUGIN_HOME="$(dirname "$(dirname "${0}")")"
+CACHE_DIR="${TMPDIR:-/tmp}/asdf-java.cache"
+
+if [ ! -d "${CACHE_DIR}" ]
+then
+    mkdir -p "${CACHE_DIR}"
+fi
+
+KERNEL_NAME="$(uname -s)"
+case "${KERNEL_NAME}" in
+    Darwin) BASE64_OPTS="-D"
+            OS="mac"
+            SHA256SUM="gsha256sum"
+            STAT="/usr/bin/stat -f %c ${CACHE_DIR}/*"
+            TEMP_DIR=$(/usr/bin/mktemp -dt asdf-java)
+            ;;
+    Linux) BASE64_OPTS="-d"
+           OS="linux"
+           SHA256SUM="sha256sum"
+           STAT="stat -c %Z ${CACHE_DIR}/*"
+           TEMP_DIR=$(mktemp -dp /tmp asdf-java.XXXXXXXX)
+           ;;
+    *) echo "Unknown operating system: ${KERNEL_NAME}"
+       exit 1
+esac
+
+trap 'test -d "${TEMP_DIR}" && rm -rf "${TEMP_DIR}"' EXIT
+
+MACHINE="$(uname -m)"
+case "${MACHINE}" in
+    x86_64) ARCHITECTURE="x64" ;;
+    *) echo "Unknown machine architecture: ${MACHINE}"
+       exit 1
+esac
+
+function check-jq() {
+  USAGE="Install jq to continue. Aborting."
+
+  if ! [ -x "$(command -v jq)" ]; then
+    echo "${USAGE}" >&2
+    exit 1;
+  fi
+}
+
+function retrieve-adoptopenjdk() {
+    URLS=("https://api.adoptopenjdk.net/v3/assets/feature_releases/{8}/ga?architecture=${ARCHITECTURE}&os=${OS}&image_type=jdk&page=0&page_size=100&project=jdk&sort_order=ASC&vendor=adoptopenjdk"
+          "https://api.adoptopenjdk.net/v3/assets/feature_releases/{9}/ga?architecture=${ARCHITECTURE}&os=${OS}&image_type=jdk&page=0&page_size=100&project=jdk&sort_order=ASC&vendor=adoptopenjdk"
+          "https://api.adoptopenjdk.net/v3/assets/feature_releases/{10}/ga?architecture=${ARCHITECTURE}&os=${OS}&image_type=jdk&page=0&page_size=100&project=jdk&sort_order=ASC&vendor=adoptopenjdk"
+          "https://api.adoptopenjdk.net/v3/assets/feature_releases/{11}/ga?architecture=${ARCHITECTURE}&os=${OS}&image_type=jdk&page=0&page_size=100&project=jdk&sort_order=ASC&vendor=adoptopenjdk"
+          "https://api.adoptopenjdk.net/v3/assets/feature_releases/{12}/ga?architecture=${ARCHITECTURE}&os=${OS}&image_type=jdk&page=0&page_size=100&project=jdk&sort_order=ASC&vendor=adoptopenjdk"
+          "https://api.adoptopenjdk.net/v3/assets/feature_releases/{13}/ga?architecture=${ARCHITECTURE}&os=${OS}&image_type=jdk&page=0&page_size=100&project=jdk&sort_order=ASC&vendor=adoptopenjdk"
+          "https://api.adoptopenjdk.net/v3/assets/feature_releases/{14}/ga?architecture=${ARCHITECTURE}&os=${OS}&image_type=jdk&page=0&page_size=100&project=jdk&sort_order=ASC&vendor=adoptopenjdk")
+
+    # shellcheck disable=SC2046
+    if [[ -z "$(ls -A "${CACHE_DIR}"/adopt-*.json 2>/dev/null)" ]] || [[ $(set -- $(${STAT}) && echo "${1}") -le $(( $(date +%s) - 3600)) ]]
+    then
+        for url in "${URLS[@]}"
+        do
+            curl -f -s -H "Accept: application/json" -L "${url}" -# -w "%{filename_effective}\n" -o "${CACHE_DIR}/adopt-#1.json" > /dev/null 2>&1
+        done
+        for i in "${CACHE_DIR}"/adopt-*.json
+        do
+            [[ -e "$i" ]] || break
+            jq '(.[].release_name) |= sub("jdk-";"adopt-openjdk-") | (.[].release_name) |= sub("^jdk";"adopt-openjdk-")' \
+               "${i}" > "${i}.temp"
+            mv "${i}.temp" "${i}"
+        done
+    fi
+}
+
+function all-json() {
+  check-jq
+  jq -s 'add' "${CACHE_DIR}"/*.json
+}
+
+function list-all() {
+    check-jq
+    retrieve-adoptopenjdk
+    local hotspot="map(select(.binaries[].jvm_impl == \"hotspot\")) \
+                   | map(.release_name) | unique[]"
+    local openj9_normal_heap="map(select(.binaries[].heap_size == \"normal\")) \
+                              | map(.release_name) | unique[] | select(contains(\"openj9\"))"
+    local openj9_large_heap="map(select(.binaries[].heap_size == \"large\")) \
+                             | map(.release_name + \"_large-heap\") | unique[] | select(contains(\"openj9\"))"
+    # shellcheck disable=SC2046
+    echo $(all-json | jq -r "${hotspot}" ; all-json | jq -r "${openj9_normal_heap}" ; all-json | jq -r "${openj9_large_heap}")
+}
+
+function list-legacy-filenames() {
+    echo ".java-version"
+}
+
+function install {
+    local package_link package_filename checksum checksum_or_checksum_link
+    local -a package sum dirs
+
+    case "${ASDF_INSTALL_VERSION}" in
+        *_large-heap) RELEASE="${ASDF_INSTALL_VERSION%%_large-heap}"
+                      HEAP_SIZE="large"
+                      ;;
+        *) RELEASE="${ASDF_INSTALL_VERSION}"
+           HEAP_SIZE="normal"
+           ;;
+    esac
+
+    check-jq
+    retrieve-adoptopenjdk
+    read -r -a package \
+         <<<"$(jq -r "map(select(.release_name==\"${RELEASE}\"))
+                      | unique[]
+                      | .binaries[]
+                      | select(.os==\"${OS}\" and .architecture==\"${ARCHITECTURE}\" and .heap_size==\"${HEAP_SIZE}\")
+                      | \"\(.package.link) \(.package.checksum // .package.checksum_link) \"" <<<"$(all-json)")"
+    package_link="${package[0]}"
+    checksum_or_checksum_link="${package[1]}"
+    package_filename=$(basename "${package_link}")
+    major_version=$(echo "$package_filename" | sed -E 's/^OpenJDK(.+)U.*$/\1/')
+    package_link="https://mirrors.tuna.tsinghua.edu.cn/AdoptOpenJDK/$major_version/jdk/$ARCHITECTURE/$OS/$package_filename"
+
+    if base64 "${BASE64_OPTS}" > /dev/null 2>&1 <<<"${checksum_or_checksum_link}"; then
+        checksum="${checksum_or_checksum_link}"
+    else
+        read -r -a sum<<<"$(curl -sL "${checksum_or_checksum_link}")"
+        checksum="${sum[0]}"
+    fi
+
+    cd "${TEMP_DIR}"
+    if ! curl -LO -# -w "${package_filename}\n" "${package_link}"; then
+        exit 1
+    fi
+
+    ${SHA256SUM} -c <<<"${checksum} ${package_filename}"
+
+    tar xf "${package_filename}"
+    read -r -a dirs <<<"$(ls -d ./*/)"
+    cd "${dirs[0]}"
+    if [ ! -d "${ASDF_INSTALL_PATH}" ]; then
+        mkdir -p "${ASDF_INSTALL_PATH}"
+    fi
+
+    case ${OS} in
+        mac) case ${RELEASE} in
+                 azul*) mv ./* "${ASDF_INSTALL_PATH}" ;;
+                 *) mv Contents/Home/* "${ASDF_INSTALL_PATH}" ;;
+             esac ;;
+        *) mv ./* "${ASDF_INSTALL_PATH}" ;;
+    esac
+}
+
+case "$(basename "${0}")" in
+    list-all) list-all
+              ;;
+    list-legacy-filenames) list-legacy-filenames
+                           ;;
+    install) install
+             ;;
+esac
